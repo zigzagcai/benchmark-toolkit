@@ -50,7 +50,6 @@ def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
 
 
-count = 0
 # set ignore_eos True by default
 async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
@@ -65,14 +64,15 @@ async def async_request_openai_completions(
     async with aiohttp.ClientSession(connector=conn, timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
             "model": request_func_input.model,
-            "messages":[{
-                "role":"system",
-                "content":prompt
+            "messages": [{
+                "role": "user",
+                "content": prompt,
             }],
             "max_tokens": request_func_input.output_len,
             "ignore_eos": True,
-            "stream": False
-    	}
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
         generated_text = ""
@@ -89,39 +89,53 @@ async def async_request_openai_completions(
                 json=payload,
                 ssl=ssl_context,
             ) as response:
-                global count
-                count += 1
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
                             continue
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                        latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["message"]["content"]:
-                                timestamp = time.perf_counter()
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
-                                most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["message"]["content"]
-                                output_len = (data.get("usage") or {}).get(
+                        # A single network chunk may contain multiple SSE lines.
+                        for line in chunk_bytes.decode("utf-8").splitlines():
+                            line = line.strip()
+                            if not line:
+                                continue
+                            chunk = remove_prefix(line, "data: ")
+                            if chunk == "[DONE]":
+                                continue
+                            try:
+                                data = json.loads(chunk)
+                            except json.JSONDecodeError:
+                                continue
+
+                            # Final usage message (from stream_options.include_usage)
+                            usage = data.get("usage")
+                            if usage:
+                                output_len = usage.get(
                                     "completion_tokens", output_len
                                 )
+
+                            choices = data.get("choices") or []
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta") or {}
+                            content = delta.get("content")
+                            if not content:
+                                continue
+
+                            timestamp = time.perf_counter()
+                            # First token
+                            if ttft == 0.0:
+                                ttft = timestamp - st
+                                output.ttft = ttft
+                            # Decoding phase
+                            else:
+                                output.itl.append(timestamp - most_recent_timestamp)
+                            most_recent_timestamp = timestamp
+                            generated_text += content
+
                     output.generated_text = generated_text
                     output.success = True
-                    output.latency = latency
+                    output.latency = time.perf_counter() - st
                     output.output_len = output_len
                 else:
                     output.error = response.reason or ""
@@ -404,7 +418,7 @@ async def benchmark(
             f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
         )
 
-    time.sleep(1.0)
+    await asyncio.sleep(1.0)
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
@@ -491,13 +505,22 @@ async def benchmark(
             "Median E2E Latency (ms):", metrics.median_e2e_latency_ms
         )
     )
+    print("{:<40} {:<10.2f}".format("Std E2E Latency (ms):", metrics.std_e2e_latency_ms))
+    print("{:<40} {:<10.2f}".format("P99 E2E Latency (ms):", metrics.p99_e2e_latency_ms))
     print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
     print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
+    print("{:<40} {:<10.2f}".format("Std TTFT (ms):", metrics.std_ttft_ms))
     print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
+    print("{s:{c}^{n}}".format(s="Time per Output Token (excl. 1st)", n=50, c="-"))
+    print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
+    print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
+    print("{:<40} {:<10.2f}".format("Std TPOT (ms):", metrics.std_tpot_ms))
+    print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
     print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
     print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
+    print("{:<40} {:<10.2f}".format("Std ITL (ms):", metrics.std_itl_ms))
     print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
